@@ -125,7 +125,7 @@ __global__ void sobelFilter(unsigned char * image, unsigned char * filtered_imag
 
 	if (x > 0 && y > 0 && x < width - 1 && y < height - 1) {
 		dx = (-1 * image[(y - 1) * width + (x - 1)]) + (-2 * image[y * width + (x - 1)]) + (-1 * image[(y + 1) * width + (x - 1)]) +
-			(image[(y - 1) * width + (x + 1)]) + (2 * image[y * width + (x + 1)]) + (image[(y + 1) * width + (x - 1)]);
+			(image[(y - 1) * width + (x + 1)]) + (2 * image[y * width + (x + 1)]) + (image[(y + 1) * width + (x + 1)]);
 
 		dy = (image[(y - 1) * width + (x - 1)]) + (2 * image[(y - 1) * width + x]) + (image[(y - 1) * width + (x + 1)]) +
 			(-1 * image[(y + 1) * width + (x - 1)]) + (-2 * image[(y + 1) * width + x]) + (-1 * image[(y + 1) * width + (x + 1)]);
@@ -133,6 +133,50 @@ __global__ void sobelFilter(unsigned char * image, unsigned char * filtered_imag
 		filtered_image[y * width + x] = sqrt(dx * dx + dy * dy);
 	}
 
+}
+
+__global__ void gaussianBlur(unsigned char *image, unsigned char *output_image, int width, int height, const int* const kernel, const int dim_kernel, int sum_of_elements){
+
+	int x = blockDim.x * blockIdx.x + threadIdx.x;
+	int y = blockDim.y * blockIdx.y + threadIdx.y;
+
+	float partial_sum = 0.0;
+
+	if (x > 0 && y > 0 && x < width - 1 && y < height - 1) {
+		for (int row = 0; row < dim_kernel; row++) {
+			for (int col = 0; col < dim_kernel; col++) {
+				int index_image_x = x + col - dim_kernel / 2;
+				int index_image_y = y + row - dim_kernel / 2;
+				index_image_x = min(max(index_image_x, 0), width - 1);
+				index_image_y = min(max(index_image_y, 0), height - 1);
+
+				partial_sum += kernel[row * dim_kernel + col] * image[index_image_y * width + index_image_x];
+			}
+		}
+
+		output_image[y * width + x] = int((float)partial_sum / sum_of_elements);
+	}
+}
+
+__global__ void binaryThreshold(unsigned char * image, unsigned char * output_image, int width, int height, int threshold) {
+
+	int x = blockDim.x * blockIdx.x + threadIdx.x;
+	int y = blockDim.y * blockIdx.y + threadIdx.y;
+
+	if (x > 0 && y > 0 && x < width - 1 && y < height - 1) {
+		if (image[y * width + x] < threshold)
+			output_image[y * width + x] = 0;
+		else
+			output_image[y * width + x] = 255;
+	}
+}
+
+__device__ int min_int(int a, int b) {
+	return a <= b ? a : b;
+}
+
+__device__ int max_int(int a, int b) {
+	return a >= b ? a : b;
 }
 
 
@@ -529,10 +573,10 @@ cudaError_t applySobelFilter(unsigned char *image, unsigned char *filtered_image
 		goto Error;
 	}
 
-	double grid_val = 20;
+	double number_of_threads = 32;
 
-	dim3 threadsPerBlock(grid_val, grid_val, 1);
-	dim3 numBlocks(ceil(width / grid_val), ceil(height / grid_val), 1);
+	dim3 threadsPerBlock(number_of_threads, number_of_threads, 1);
+	dim3 numBlocks(ceil(width / number_of_threads), ceil(height / number_of_threads), 1);
 
 	sobelFilter << <numBlocks, threadsPerBlock >> > (d_image, d_filtered_image, height, width);
 
@@ -547,6 +591,158 @@ cudaError_t applySobelFilter(unsigned char *image, unsigned char *filtered_image
 	cudaStatus = cudaDeviceSynchronize();
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching sobelFilter!\n", cudaStatus);
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(filtered_image, d_filtered_image, height * width * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+Error:
+	cudaFree(d_filtered_image);
+	cudaFree(d_image);
+
+	return cudaStatus;
+}
+
+cudaError_t applyGaussianFilter(unsigned char *image, unsigned char *filtered_image, int width, int height, const int dim_kernel) {
+	int kernel[25] = {
+		   1, 4, 6, 4, 1,
+		   4, 16, 24, 16, 4,
+		   6, 24, 36, 24, 6,
+		   4, 16, 24, 16, 4,
+		   1, 4, 6, 4, 1
+	};
+
+	cudaError_t cudaStatus;
+
+	unsigned char *d_image;
+	unsigned char *d_filtered_image;
+	int *d_kernel;
+
+
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc(&d_image, width * height * sizeof(unsigned char));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc(&d_filtered_image, width * height * sizeof(unsigned char));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc(&d_kernel, dim_kernel * dim_kernel * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(d_kernel, kernel, dim_kernel * dim_kernel * sizeof(int), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(d_image, image, width * height * sizeof(unsigned char), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	double number_of_threads = 32;
+
+	dim3 threadsPerBlock(number_of_threads, number_of_threads, 1);
+	dim3 numBlocks(ceil(width / number_of_threads), ceil(height / number_of_threads), 1);
+
+	gaussianBlur << <numBlocks, threadsPerBlock >> > (d_image, d_filtered_image, width, height, d_kernel, dim_kernel, 256);
+
+
+	// Check for any errors launching the kernel
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "gaussianBlur launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	cudaStatus = cudaDeviceSynchronize();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching gaussianBlur!\n", cudaStatus);
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(filtered_image, d_filtered_image, height * width * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+Error:
+	cudaFree(d_filtered_image);
+	cudaFree(d_image);
+	cudaFree(d_kernel);
+
+	return cudaStatus;
+}
+
+cudaError_t applyBinaryThreshold(unsigned char * image, unsigned char * filtered_image, int width, int height, const int threshold)
+{
+	cudaError_t cudaStatus;
+
+	unsigned char *d_image;
+	unsigned char *d_filtered_image;
+
+
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc(&d_image, width * height * sizeof(unsigned char));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc(&d_filtered_image, width * height * sizeof(unsigned char));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(d_image, image, width * height * sizeof(unsigned char), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	double number_of_threads = 32;
+
+	dim3 threadsPerBlock(number_of_threads, number_of_threads, 1);
+	dim3 numBlocks(ceil(width / number_of_threads), ceil(height / number_of_threads), 1);
+
+	binaryThreshold << <numBlocks, threadsPerBlock >> > (d_image, d_filtered_image, width, height, threshold);
+
+	// Check for any errors launching the kernel
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "binaryThreshold launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	cudaStatus = cudaDeviceSynchronize();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching binaryThreshold!\n", cudaStatus);
 		goto Error;
 	}
 
